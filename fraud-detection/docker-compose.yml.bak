@@ -1,0 +1,163 @@
+version: '3.8'
+
+services:
+  zookeeper:
+    image: karthiksiddu24/cisco_fraud_detection:zookeeper
+    container_name: zookeeper
+    ports:
+      - "2181:2181"
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+
+  kafka:
+    image: karthiksiddu24/cisco_fraud_detection:kafka
+    container_name: kafka
+    ports:
+      - "9092:9092"
+      - "29092:29092"
+    depends_on:
+      - zookeeper
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:29092,PLAINTEXT_HOST://localhost:9092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+
+  mongodb:
+    image: karthiksiddu24/cisco_fraud_detection:mongodb
+    container_name: mongodb
+    ports:
+      - "27017:27017"
+    volumes:
+      - mongodb_data:/data/db
+
+  backend:
+    image: karthiksiddu24/cisco_fraud_detection:backend
+    container_name: backend
+    ports:
+      - "8000:8000"
+    environment:
+      KAFKA_BROKER: kafka:29092
+      MONGODB_URL: mongodb://mongodb:27017
+      DB_NAME: fraud_detection
+    depends_on:
+      - kafka
+      - mongodb
+
+  customer-service:
+    image: karthiksiddu24/cisco_fraud_detection:customer_service
+    container_name: customer-service
+    command: ["/opt/conda/envs/morpheus/bin/uvicorn", "customer_api:app", "--host", "0.0.0.0", "--port", "5000"]
+    ports:
+      - "5000:5000"
+    environment:
+      KAFKA_BROKER: kafka:29092
+      TRITON_URL: tritonserver:8005
+    depends_on:
+      - kafka
+      - tritonserver
+
+  frontend:
+    image: karthiksiddu24/cisco_fraud_detection:frontend-v2
+    container_name: frontend
+    command: >
+      sh -c "find .next -name '*.json' -exec sed -i 's/customer_service/customer-service/g' {} + && npm start"
+    ports:
+      - "3000:3000"
+    environment:
+      CUSTOMER_SERVICE_URL: http://customer-service:5000
+      NEXT_PUBLIC_CUSTOMER_SERVICE_URL: http://localhost:5000
+      CUSTOMER_SERVICE_HOST: customer-service
+    depends_on:
+      - customer-service
+
+  model-loader:
+    image: karthiksiddu24/cisco_fraud_detection:models
+    container_name: model-loader
+    command: ["/bin/sh", "-c", "cp -r /models/* /model_repo/"]
+    volumes:
+      - model_repo:/model_repo
+
+  tritonserver:
+    image: karthiksiddu24/cisco_fraud_detection:tritonserver_base
+    container_name: tritonserver
+    command: ["tritonserver", "--model-repository=/model_repo", "--exit-timeout-secs=6000", "--http-port=8005", "--grpc-port=8006", "--metrics-port=8007"]
+    ports:
+      - "8005:8005"
+      - "8006:8006"
+      - "8007:8007"
+    volumes:
+      - model_repo:/model_repo
+    depends_on:
+      model-loader:
+        condition: service_completed_successfully
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+
+  nim-llm:
+    image: karthiksiddu24/cisco_fraud_detection:nim_llm
+    container_name: nim-llm
+    ports:
+      - "8009:8000"
+    environment:
+      NGC_API_KEY: ${NGC_API_KEY}
+      NIM_GPU_MEMORY_UTILIZATION: 0.5
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+
+  morpheus-pipeline:
+    image: karthiksiddu24/cisco_fraud_detection:morpheus_pipeline
+    container_name: morpheus-pipeline
+    command: >
+      /bin/bash -c "python -m ensurepip && python -m pip install kafka-python numpy pandas scikit-learn==1.6.1 tritonclient[http] category_encoders && python pipeline_custom.py & sleep 10 && python producer.py --speed 5 & wait"
+    environment:
+      KAFKA_BROKER: kafka:29092
+      TRITON_URL: tritonserver:8005
+      KAFKA_TOPIC_IN: transactions_raw
+    depends_on:
+      - kafka
+      - tritonserver
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+
+  morpheus-priority:
+    image: karthiksiddu24/cisco_fraud_detection:morpheus_priority
+    container_name: morpheus-priority
+    command: >
+      /bin/bash -c "python -m ensurepip && python -m pip install kafka-python numpy pandas scikit-learn==1.6.1 tritonclient[http] category_encoders && python pipeline_custom.py"
+    environment:
+      KAFKA_BROKER: kafka:29092
+      TRITON_URL: tritonserver:8005
+      KAFKA_TOPIC_IN: transactions_priority
+    depends_on:
+      - kafka
+      - tritonserver
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+
+volumes:
+  mongodb_data:
+  model_repo:
