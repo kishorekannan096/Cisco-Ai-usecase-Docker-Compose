@@ -1,0 +1,51 @@
+version: "3.8"
+
+services:
+
+  # postgres:
+  #   image: postgres:15
+  #   container_name: insurance-postgres
+  #   restart: unless-stopped
+  #   environment:
+  #     POSTGRES_DB: insurance_db
+  #     POSTGRES_USER: insurance_user
+  #     POSTGRES_PASSWORD: insurance_password
+  #   volumes:
+  #     - postgres_data:/var/lib/postgresql/data
+  #   ports:
+  #     - "5432:5432"   # Optional: remove in prod if not needed
+  #   healthcheck:
+  #     test: ["CMD-SHELL", "pg_isready -U insurance_user"]
+  #     interval: 10s
+  #     timeout: 5s
+  #     retries: 5
+  #   networks:
+  #     - shopping-network
+
+  mongodb:
+    image: kishorek123/insurance-chat-assiatant:mongo  # was mongo:6
+    container_name: insurance-mongodb
+    restart: unless-stopped
+    environment:
+      MONGO_INITDB_DATABASE: insurance_users
+    volumes:
+      - mongo_data:/data/db
+    ports:
+      - "27017:27017" # Optional: remove in prod
+    healthcheck:
+      test: [ "CMD", "mongosh", "--eval", "db.adminCommand('ping')" ]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - shopping-network
+
+volumes:
+  # postgres_data:
+  mongo_data:
+
+
+networks:
+  shopping-network:
+    external: true
+    name: retail-shopping-assistant_shopping-network
