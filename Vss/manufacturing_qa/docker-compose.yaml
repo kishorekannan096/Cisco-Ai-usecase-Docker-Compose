@@ -1,0 +1,23 @@
+services:
+  manufacturing-qa:
+    image: kishorek123/manufacturing-qa:v2
+    # build: .
+    ports:
+      - "7865:7865"
+    env_file: .env
+    environment:
+      - MEDIA_BASE_DIR=/tmp
+    volumes:
+      - vss_shared_media:/tmp
+      - ./storage:/app/storage
+      - ./videos:/app/videos
+    networks:
+      - vss-shared-network
+
+volumes:
+  vss_shared_media:
+    external: true
+
+networks:
+  vss-shared-network:
+    external: true
