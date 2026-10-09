@@ -1,0 +1,484 @@
+services:
+
+  ###############################################
+  # 1. FACE ANTI-SPOOFING + EMBEDDING SERVICE  #
+  ###############################################
+  face-embedding-api:
+    build:
+      context: ./face_embedding_api
+      dockerfile: Dockerfile
+    image: ribinbaby/insureguard:face-embedding-api
+    container_name: facenet-embedding-api
+    ports:
+      - "8090:8000"
+    volumes:
+      - ./face_embedding_api/resources:/app/resources:ro
+    environment:
+      - HOST=0.0.0.0
+      - PORT=8000
+      - LOG_LEVEL=info
+      - WORKERS=1
+      - MODEL_ROOT=/app/resources
+      - DEEPFACE_HOME=/app/resources
+      - ENABLE_ANTISPOOFING=true
+      - ANTISPOOFING_MODEL_DIR=/app/resources/anti_spoof_models
+      - DEVICE_ID=0
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              capabilities: [ gpu ]
+              device_ids: [ '${FACEMBEDDING_GPU_ID:-2}' ]
+    restart: unless-stopped
+    healthcheck:
+      test: [ "CMD", "curl", "-f", "http://localhost:8000/health" ]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 15s
+    networks:
+      - kyc_net
+
+  ###############################################
+  # 2. NEMO RETRIEVER OCR SERVICE               #
+  ###############################################
+  nemoretriever-parser:
+    image: nvcr.io/nim/nvidia/nemoretriever-parse:latest
+    container_name: nemoretriever-parser
+    runtime: nvidia
+    user: "${USERID}"
+    volumes:
+      - /home/administrator/KYC/volumes/nim_cache:/opt/nim/.cache
+    ports:
+      - "8010:8000"
+    shm_size: "16gb"
+    environment:
+      - NIM_HTTP_API_PORT=8000
+      - NIM_TRITON_LOG_VERBOSE=1
+      - NVIDIA_API_KEY=${NGC_API_KEY:-nvidiaapikey}
+      - NGC_API_KEY=${NGC_API_KEY:-nvidiaapikey}
+      - CUDA_VISIBLE_DEVICES=0
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: [ '${NEMORETRIEVER_PARSE_MS_GPU_ID:-3}' ]
+              capabilities: [ gpu ]
+    networks:
+      - kyc_net
+
+  ###############################################
+  # 3. LLAMA 3.1 8B INSTRUCT LLM PARSER         #
+  ###############################################
+  llama-parser:
+    image: nvcr.io/nim/meta/llama-3.1-8b-instruct:1.8.5
+    container_name: llama-parser
+    runtime: nvidia
+    user: "${USERID}"
+    environment:
+      - NGC_API_KEY=${NGC_API_KEY}
+      - NIM_MAX_MODEL_LEN=4096
+    volumes:
+      - /home/administrator/KYC/volumes/nim_cache:/opt/nim/.cache
+    ports:
+      - "8020:8000"
+    shm_size: "16gb"
+    ulimits:
+      nofile:
+        soft: 65536
+        hard: 65536
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              #count: ${INFERENCE_GPU_COUNT:-all}
+              device_ids: [ '${LLM_MS_GPU_ID:-0}' ]
+              capabilities: [ gpu ]
+    networks:
+      - kyc_net
+
+  ###############################################
+  # 4. MILVUS GPU + ETCD + MINIO                #
+  ###############################################
+
+  etcd:
+    container_name: milvus-etcdkyc
+    image: quay.io/coreos/etcd:v3.6.5
+    environment:
+      - ETCD_AUTO_COMPACTION_MODE=revision
+      - ETCD_AUTO_COMPACTION_RETENTION=1000
+      - ETCD_QUOTA_BACKEND_BYTES=4294967296
+      - ETCD_SNAPSHOT_COUNT=50000
+    volumes:
+      - /home/administrator/KYC/volumes/etcd:/etcd
+    command: etcd -advertise-client-urls=http://127.0.0.1:2379 -listen-client-urls http://0.0.0.0:2379 --data-dir /etcd
+    healthcheck:
+      test: [ "CMD", "etcdctl", "endpoint", "health" ]
+      interval: 30s
+      timeout: 20s
+      retries: 3
+    profiles: [ "", "milvus" ]
+    networks:
+      - kyc_net
+
+  minio:
+    container_name: milvus-miniokyc
+    image: minio/minio:RELEASE.2025-09-07T16-13-09Z
+    environment:
+      MINIO_ACCESS_KEY: minioadmin
+      MINIO_SECRET_KEY: minioadmin
+    ports:
+      - "9011:9011"
+      - "9010:9010"
+    volumes:
+      - /home/administrator/KYC/volumes/minio:/minio_data
+    command: minio server /minio_data --console-address ":9011" --address ":9010"
+    healthcheck:
+      test: [ "CMD", "curl", "-f", "http://localhost:9010/minio/health/live" ]
+      interval: 30s
+      timeout: 20s
+      retries: 3
+    profiles: [ "", "milvus", "elasticsearch", "minio" ]
+    networks:
+      - kyc_net
+
+  milvus:
+    container_name: milvus-standalonekyc
+    image: milvusdb/milvus:v2.6.2-gpu # milvusdb/milvus:v2.6.2 for CPU
+    command: [ "milvus", "run", "standalone" ]
+    environment:
+      ETCD_ENDPOINTS: etcd:2379
+      MINIO_ADDRESS: minio:9010
+      KNOWHERE_GPU_MEM_POOL_SIZE: 2048;4096
+    volumes:
+      - /home/administrator/KYC/volumes/milvus:/var/lib/milvus
+    # healthcheck:
+    #   test: ["CMD", "curl", "-f", "http://localhost:9091/healthz"]
+    #   interval: 30s
+    #   start_period: 90s
+    #   timeout: 20s
+    #   retries: 3
+    ports:
+      - "19530:19530"
+      - "9091:9091"
+    depends_on:
+      - "etcd"
+      - "minio"
+    # Comment out this section if CPU based image is used and set below env variables to False
+    # export APP_VECTORSTORE_ENABLEGPUSEARCH=False
+    # export APP_VECTORSTORE_ENABLEGPUINDEX=False
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              capabilities: [ "gpu" ]
+              # count: ${INFERENCE_GPU_COUNT:-all}
+              device_ids: [ '${VECTORSTORE_GPU_DEVICE_ID:-0}' ]
+    profiles: [ "", "milvus" ]
+    networks:
+      - kyc_net
+
+  ###############################################
+  # 5. POSTGRESQL DB (Shared for KYC + Claims) #
+  ###############################################
+  postgres:
+    image: postgres:15
+    container_name: postgres-sharedkyc
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres_password
+      POSTGRES_MULTIPLE_DATABASES: kyc_db,claims_db
+    ports:
+      - "5432:5432"
+    volumes:
+      - /home/administrator/KYC/volumes/postgres:/var/lib/postgresql/data
+      - ./init-multiple-databases.sh:/docker-entrypoint-initdb.d/init-multiple-databases.sh
+    healthcheck:
+      test: [ "CMD-SHELL", "pg_isready -U postgres" ]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    networks:
+      - kyc_net
+
+  ###############################################
+  # 6. NEW KYC VERIFICATION ORCHESTRATION SVC   #
+  ###############################################
+  kyc-verifier:
+    build:
+      context: ./kyc-verifier
+      dockerfile: Dockerfile
+    image: ribinbaby/insureguard:kyc-verifier
+    container_name: kyc-verifier
+    restart: unless-stopped
+    environment:
+      - POSTGRES_URL=postgresql+asyncpg://postgres:postgres_password@postgres:5432/kyc_db
+      - MILVUS_HOST=milvus
+      - MILVUS_PORT=19530
+      - OCR_URL=http://nemoretriever-parser:8000/v1/chat/completions
+      - LLM_URL=http://llama-parser:8000/v1/chat/completions
+      - ANTISPOOF_URL=http://facenet-embedding-api:8000/embed
+      - MINIO_ENDPOINT=minio:9010
+      - MINIO_ACCESS_KEY=minioadmin
+      - MINIO_SECRET_KEY=minioadmin
+      # Defaults
+      - VECTOR_DIM=512
+      - VERIFY_THRESHOLD=15
+      - REVIEW_THRESHOLD=5
+      - ANTISPOOF_CONFIDENCE_MIN=0.8
+
+      # model
+      - LLM_MODEL=${LLM_MODEL:-'meta/llama-3.1-8b-instruct'}
+    ports:
+      - "8095:8000"
+    depends_on:
+      - postgres
+      - milvus
+      - nemoretriever-parser
+      - llama-parser
+      - face-embedding-api
+      - minio
+    networks:
+      - kyc_net
+
+  ###############################################
+  # 7. ENHANCED FORGERY DETECTION SERVICE      #
+  ###############################################
+  forgery-detection-api:
+    build:
+      context: ./forgery_detection_api
+      dockerfile: Dockerfile
+    image: ribinbaby/insureguard:forgery-detection-api
+    container_name: forgery-detection-api
+    restart: unless-stopped
+    environment:
+      - HIVE_AI_URL=http://hive-ai-detection:8000
+      - FORGERY_THRESHOLD=0.7
+      - NVIDIA_API_KEY=${NVIDIA_API_KEY}
+    ports:
+      - "8060:8000"
+    volumes:
+      - ./forgery_detection_api/uploads:/app/uploads
+      - ./forgery_detection_api/outputs:/app/outputs
+      - ./forgery_detection_api/models:/app/models:ro
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              capabilities: [ gpu ]
+              device_ids: [ '${FORGERY_GPU_ID:-2}' ]
+    networks:
+      - kyc_net
+
+  ###############################################
+  # 7b. HIVE AI detection (Reference)          #
+  ###############################################
+  # hive-ai-detection:
+  # ... (rest of commented out hive section)
+
+  ###############################################
+  # 8. NEMOTRON VLM DAMAGE DETECTION           #
+  ###############################################
+  nemotron-vlm:
+    image: nvcr.io/nim/nvidia/llama-3.1-nemotron-nano-vl-8b-v1:latest
+    container_name: nemotron-vlm
+    runtime: nvidia
+    user: "${USERID}"
+    environment:
+      - NGC_API_KEY=${NGC_API_KEY}
+    volumes:
+      - /home/administrator/KYC/volumes/nim_cache_nemotron:/opt/nim/.cache
+    ports:
+      - "8040:8000"
+    shm_size: "16gb"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: [ '${NEMOTRON_GPU_ID:-5}' ]
+              capabilities: [ gpu ]
+    networks:
+      - kyc_net
+
+  ###############################################
+  # 9. NV-CLIP EMBEDDINGS SERVICE              #
+  ###############################################
+  nvclip:
+    image: nvcr.io/nim/nvidia/nvclip:latest
+    container_name: nvclip
+    runtime: nvidia
+    user: "${USERID}"
+    environment:
+      - NGC_API_KEY=${NGC_API_KEY}
+    volumes:
+      - /home/administrator/KYC/volumes/nim_cache_nvclip:/opt/nim/.cache
+    ports:
+      - "8050:8000"
+    shm_size: "8gb"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: [ '${NVCLIP_GPU_ID:-2}' ]
+              capabilities: [ gpu ]
+    networks:
+      - kyc_net
+
+  ###############################################
+  # 10. CLAIMS BACKEND API SERVICE             #
+  ###############################################
+  claims-backend:
+    build:
+      context: ./insurance-claims-kyc/backend
+      dockerfile: Dockerfile
+    image: ribinbaby/insureguard:claims-backend
+    container_name: claims-backend
+    restart: unless-stopped
+    environment:
+      # Database
+      - DATABASE_URL=postgresql+asyncpg://postgres:postgres_password@postgres:5432/claims_db
+
+      # KYC Service (internal network)
+      - KYC_VERIFIER_URL=http://kyc-verifier:8000
+
+      # AI Services
+      - HIVE_AI_URL=http://hive-ai-detection:8000
+      - NEMOTRON_VLM_URL=http://nemotron-vlm:8000
+      - NVCLIP_URL=http://nvclip:8000
+      - LLM_DECISION_URL=http://llama-parser:8000
+
+      # Milvus (shared with KYC)
+      - MILVUS_HOST=milvus
+      - MILVUS_PORT=19530
+      - MILVUS_COLLECTION=vehicle_images
+
+      # MinIO Storage (shared with KYC)
+      - MINIO_ENDPOINT=minio:9010
+      - MINIO_ACCESS_KEY=minioadmin
+      - MINIO_SECRET_KEY=minioadmin
+      - MINIO_BUCKET=claims-data
+
+      # Thresholds
+      - FORGERY_THRESHOLD=0.7
+      - DUPLICATE_THRESHOLD=0.95
+      - FORGERY_DETECTION_API_URL=http://forgery-detection-api:8000
+      
+      # model
+      - LLM_MODEL=${LLM_MODEL:-'meta/llama-3.1-8b-instruct'}
+
+      # Upload
+      - UPLOAD_DIR=/app/uploads
+    ports:
+      - "8100:8000"
+    volumes:
+      - ./insurance-claims-kyc/backend:/app
+      - ./insurance-claims-kyc/uploads:/app/uploads
+    depends_on:
+      postgres:
+        condition: service_healthy
+      milvus:
+        condition: service_started
+      # hive-ai-detection removed - requires NGC org access
+      nemotron-vlm:
+        condition: service_started
+      nvclip:
+        condition: service_started
+      llama-parser:
+        condition: service_started
+      kyc-verifier:
+        condition: service_started
+      forgery-detection-api:
+        condition: service_started
+    networks:
+      - kyc_net
+
+  ###############################################
+  # 11. CLAIMS FRONTEND SERVICE                #
+  ###############################################
+  claims-frontend:
+    build:
+      context: ./insurance-claims-kyc/frontend
+      dockerfile: Dockerfile
+    image: ribinbaby/insureguard:claims-frontend
+    container_name: claims-frontend
+    ports:
+      - "3100:80"
+    environment:
+      - VITE_BACKEND_URL=http://claims-backend:8000
+    depends_on:
+      - claims-backend
+    networks:
+      - kyc_net
+
+  ###############################################
+  # 12. ADMIN DASHBOARD SERVICE                #
+  ###############################################
+  admin-dashboard:
+    build:
+      context: ./admin_dashboard
+      dockerfile: Dockerfile
+    image: ribinbaby/insureguard:admin-dashboard
+    container_name: admin-dashboard
+    ports:
+      - "3200:80"
+    environment:
+      - VITE_BACKEND_URL=http://claims-backend:8000
+    depends_on:
+      - claims-backend
+    networks:
+      - kyc_net
+
+  jupyterlab:
+    image: jupyter/base-notebook:latest
+    container_name: jupyterlab
+    restart: unless-stopped
+    ports:
+      - "8888:8888"
+    volumes:
+      - /home/administrator/KYC/volumes/jupyter_data:/home/jovyan/work
+    command: >
+      start-notebook.sh
+      --NotebookApp.token=''
+      --NotebookApp.password=''
+      --NotebookApp.allow_origin='*'
+      --NotebookApp.ip=0.0.0.0
+      --NotebookApp.port=8888
+    environment:
+      - JUPYTER_ENABLE_LAB=yes
+      - GRANT_SUDO=yes
+    networks:
+      - kyc_net
+
+  hive-ai-detection:
+    build:
+      context: ./ai_gen_check_api
+    container_name: hive-ai-detection
+    environment:
+      - CUDA_VISIBLE_DEVICES=2
+      - HF_HOME=/root/.cache/huggingface
+    ports:
+      - "8070:8000"
+    volumes:
+      - /home/administrator/KYC/volumes/hf_cache:/root/.cache/huggingface
+    runtime: nvidia
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ['2']
+              capabilities: [gpu]
+    networks:
+      - kyc_net
+
+networks:
+  kyc_net:
+    driver: bridge
